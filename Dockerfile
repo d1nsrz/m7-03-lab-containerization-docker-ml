@@ -1,27 +1,32 @@
-# Reference Dockerfile — m7-03 lab (Containerization with Docker for ML).
+# Modified Dockerfile — m7-03 lab (Containerization with Docker for ML) v2.
 #
-# Multi-stage build that:
-#   * Stage 1 (builder)  — fetches the ONNX Runtime release, compiles the
-#                          provided C verifier against it, and validates
-#                          the bundled model.onnx artifact.
-#   * Stage 2 (runtime)  — ships only the compiled binary, the ONNX
-#                          Runtime shared library, the model file, and
-#                          a non-root user. No compilers, no tarballs.
+# Improvements over v1:
+#   - Base image pinned by digest in BOTH stages (supply-chain hygiene)
+#   - Provenance LABELs added to stage 2 (model source, framework, ORT version, maintainer)
+#   - HEALTHCHECK added to stage 2
 #
-# Before building: copy your cat-detection model.onnx from the m6-09
-# assessment into the repo root. The file is gitignored by default — do
-# NOT commit it.
+# How to get the current debian:12-slim digest before building:
+#   docker pull debian:12-slim
+#   docker inspect --format '{{index .RepoDigests 0}}' debian:12-slim
+# Paste the printed digest (everything after the @) into DEBIAN_DIGEST below.
+# Both stages must use the same digest.
 #
-# Build:    docker build -t <ns>/m7-03-cat-detection:v1 .
-# Run:      docker run --rm <ns>/m7-03-cat-detection:v1
+# Build:    docker build -t <ns>/m7-03-cat-detection:v2 .
+# Run:      docker run --rm <ns>/m7-03-cat-detection:v2
 # Verify:   uid should be 1001; image size should be < ~250 MB
 
 ARG ORT_VERSION=1.20.1
 
+# 3b — pin the base image digest here. Replace the placeholder with the
+#       real sha256 you get from the docker inspect command above.
+#       Example: sha256:056653329ed9a985f2e1fcb76da48ad300561558ca9f4432e74db4d7fab1277c
+ARG DEBIAN_DIGEST=sha256:056653329ed9a985f2e1fcb76da48ad300561558ca9f4432e74db4d7fab1277c
+
 # ──────────────────────────────────────────────────────────────
 # Stage 1 — builder
 # ──────────────────────────────────────────────────────────────
-FROM debian:12-slim AS builder
+# 3b: base image pinned by digest so this stage cannot silently drift
+FROM --platform=linux/amd64 debian:12-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS builder
 ARG ORT_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -55,7 +60,8 @@ RUN test -s /tmp/model.onnx \
 # ──────────────────────────────────────────────────────────────
 # Stage 2 — runtime
 # ──────────────────────────────────────────────────────────────
-FROM debian:12-slim AS runtime
+# 3b: same digest as stage 1 — both stages pin to the identical base layer
+FROM --platform=linux/amd64 debian:12-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime
 ARG ORT_VERSION
 
 # Runtime-only deps: ca-certs for general hygiene; libstdc++6 because the
@@ -75,7 +81,21 @@ COPY --from=builder --chown=app:app /tmp/model.onnx /home/app/model.onnx
 # Tell the dynamic linker where to find libonnxruntime at runtime
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
+# 3a — provenance LABELs: records what model and runtime version are baked in,
+#      and who is responsible. Visible via docker image inspect.
+LABEL model.source="m6-09-assessment"
+LABEL model.framework="ultralytics-yolo26"
+LABEL ort.version="${ORT_VERSION}"
+LABEL maintainer="<your-github-handle>"
+
 USER app
 WORKDIR /home/app
+
+# 3c — HEALTHCHECK: orchestrators (Compose, Swarm, K8s liveness probes via
+#      exec) will run this command every 30 s. For a verifier container the
+#      health check is the same as CMD — in a real serving container it would
+#      hit a /health HTTP endpoint instead.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD check_model /home/app/model.onnx || exit 1
 
 CMD ["check_model", "/home/app/model.onnx"]
